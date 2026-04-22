@@ -124,6 +124,55 @@ function extractSessionData(entries) {
   return queries;
 }
 
+async function parseSubagents(sessionDir) {
+  const subagents = [];
+  if (!fs.existsSync(sessionDir)) return subagents;
+
+  function walkDir(dir) {
+    let files = [];
+    try {
+      for (const f of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, f.name);
+        if (f.isDirectory()) files = files.concat(walkDir(full));
+        else if (f.name.endsWith('.jsonl')) files.push(full);
+      }
+    } catch { }
+    return files;
+  }
+
+  const files = walkDir(sessionDir);
+  for (const filePath of files) {
+    let entries;
+    try { entries = await parseJSONLFile(filePath); } catch { continue; }
+    if (entries.length === 0) continue;
+
+    const queries = extractSessionData(entries);
+    if (queries.length === 0) continue;
+
+    let inputTokens = 0, outputTokens = 0, cacheCreationTokens = 0, cacheReadTokens = 0, cost = 0;
+    for (const q of queries) {
+      inputTokens += q.inputTokens;
+      outputTokens += q.outputTokens;
+      cacheCreationTokens += q.cacheCreationTokens;
+      cacheReadTokens += q.cacheReadTokens;
+      cost += q.cost;
+    }
+    const totalTokens = inputTokens + cacheCreationTokens + cacheReadTokens + outputTokens;
+
+    const modelCounts = {};
+    for (const q of queries) {
+      if (q.model && q.model !== '<synthetic>') modelCounts[q.model] = (modelCounts[q.model] || 0) + 1;
+    }
+    const model = Object.entries(modelCounts).sort((a, b) => b[1] - a[1])[0]?.[0] || 'unknown';
+
+    const basename = path.basename(filePath, '.jsonl');
+    const agentId = basename.replace(/^agent-/, '');
+
+    subagents.push({ agentId, model, queryCount: queries.length, inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens, totalTokens, cost });
+  }
+  return subagents;
+}
+
 async function parseAllSessions() {
   const claudeDir = getClaudeDir();
   const projectsDir = path.join(claudeDir, 'projects');
@@ -250,6 +299,14 @@ async function parseAllSessions() {
       }
       flushPrompt();
 
+      // Subagents: look for a directory named after this session ID
+      const sessionSubDir = path.join(dir, sessionId);
+      const subagents = await parseSubagents(sessionSubDir);
+      const subagentTotals = subagents.reduce(
+        (acc, s) => ({ totalTokens: acc.totalTokens + s.totalTokens, cost: acc.cost + s.cost }),
+        { totalTokens: 0, cost: 0 }
+      );
+
       sessions.push({
         sessionId,
         project: projectDir,
@@ -265,6 +322,8 @@ async function parseAllSessions() {
         cacheReadTokens,
         totalTokens,
         cost,
+        subagents,
+        subagentTotals,
       });
 
       // Daily
